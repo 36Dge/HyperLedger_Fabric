@@ -199,7 +199,89 @@ type ChannelParticipation struct {
 	MaxRequestBodySize uint32
 }
 
+//defaults carries the default orderer configuration values
 
+var Defaults = TopLevel{
+	General: General{
+		ListenAddress:   "127.0.0.1",
+		ListenPort:      7050,
+		BootstrapMethod: "file",
+		BootstrapFile:   "genesisblock",
+		Profile: Profile{
+			Enabled: false,
+			Address: "0.0.0.0:6060",
+		},
+		Cluster: Cluster{
+			ReplicationMaxRetries:                12,
+			RPCTimeout:                           time.Second * 7,
+			DialTimeout:                          time.Second * 5,
+			ReplicationBufferSize:                20971520,
+			SendBufferSize:                       10,
+			ReplicationBackgroundRefreshInterval: time.Minute * 5,
+			ReplicationRetryTimeout:              time.Second * 5,
+			ReplicationPullTimeout:               time.Second * 5,
+			CertExpirationWarningThreshold:       time.Hour * 24 * 7,
+		},
+		LocalMSPDir: "msp",
+		LocalMSPID:  "SampleOrg",
+		BCCSP:       bccsp.GetDefaultOpts(),
+		Authentication: Authentication{
+			TimeWindow: time.Duration(15 * time.Minute),
+		},
+	},
+	FileLedger: FileLedger{
+		Location: "/var/hyperledger/production/orderer",
+	},
+	Kafka: Kafka{
+		Retry: Retry{
+			ShortInterval: 1 * time.Minute,
+			ShortTotal:    10 * time.Minute,
+			LongInterval:  10 * time.Minute,
+			LongTotal:     12 * time.Hour,
+			NetworkTimeouts: NetworkTimeouts{
+				DialTimeout:  30 * time.Second,
+				ReadTimeout:  30 * time.Second,
+				WriteTimeout: 30 * time.Second,
+			},
+			Metadata: Metadata{
+				RetryBackoff: 250 * time.Millisecond,
+				RetryMax:     3,
+			},
+			Producer: Producer{
+				RetryBackoff: 100 * time.Millisecond,
+				RetryMax:     3,
+			},
+			Consumer: Consumer{
+				RetryBackoff: 2 * time.Second,
+			},
+		},
+		Verbose: false,
+		Version: sarama.V0_10_2_0,
+		TLS: TLS{
+			Enabled: false,
+		},
+		Topic: Topic{
+			ReplicationFactor: 3,
+		},
+	},
+	Debug: Debug{
+		BroadcastTraceDir: "",
+		DeliverTraceDir:   "",
+	},
+	Operations: Operations{
+		ListenAddress: "127.0.0.1:0",
+	},
+	Metrics: Metrics{
+		Provider: "disabled",
+	},
+	ChannelParticipation: ChannelParticipation{
+		Enabled:            false,
+		MaxRequestBodySize: 1024 * 1024,
+	},
+	Admin: Admin{
+		ListenAddress: "127.0.0.1:0",
+	},
+}
 
 
 

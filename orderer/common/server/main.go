@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"fabricProject/internal/pkg/comm"
 	"fabricProject/orderer/common/localconfig"
 	"fmt"
 	"io/ioutil"
@@ -310,7 +312,6 @@ func initSystemChannelWithJoinBlock(
 }
 
 
-
 func loadLocalMSP(conf *localconfig.TopLevel) msp.MSP {
 	// MUST call GetLocalMspConfig first, so that default BCCSP is properly
 	// initialized prior to LoadByType.
@@ -346,3 +347,144 @@ func initializeLogging() {
 		LogSpec: loggingSpec,
 	})
 }
+
+
+func initializeMultichannelRegistrar(
+	bootstrapBlock *cb.Block,
+	repInitiator *onboarding.ReplicationInitiator,
+	clusterDialer *cluster.PredicateDialer,
+	srvConf comm.ServerConfig,
+	srv *comm.GRPCServer,
+	conf *localconfig.TopLevel,
+	signer identity.SignerSerializer,
+	metricsProvider metrics.Provider,
+	healthChecker healthChecker,
+	lf blockledger.Factory,
+	bccsp bccsp.BCCSP,
+	callbacks ...channelconfig.BundleActor,
+) *multichannel.Registrar {
+	registrar := multichannel.NewRegistrar(*conf, lf, signer, metricsProvider, bccsp, clusterDialer, callbacks...)
+
+	consenters := map[string]consensus.Consenter{}
+
+	var icr etcdraft.InactiveChainRegistry
+	if conf.General.BootstrapMethod == "file" || conf.General.BootstrapMethod == "none" {
+		if bootstrapBlock != nil && isClusterType(bootstrapBlock, bccsp) {
+			// with a system channel
+			etcdConsenter := initializeEtcdraftConsenter(consenters, conf, lf, clusterDialer, bootstrapBlock, repInitiator, srvConf, srv, registrar, metricsProvider, bccsp)
+			icr = etcdConsenter.InactiveChainRegistry
+		} else if bootstrapBlock == nil {
+			// without a system channel: assume cluster type, InactiveChainRegistry == nil, no go-routine.
+			consenters["etcdraft"] = etcdraft.New(clusterDialer, conf, srvConf, srv, registrar, nil, metricsProvider, bccsp)
+		}
+	}
+
+	consenters["solo"] = solo.New()
+	var kafkaMetrics *kafka.Metrics
+	consenters["kafka"], kafkaMetrics = kafka.New(conf.Kafka, metricsProvider, healthChecker, icr, registrar.CreateChain)
+
+	// Note, we pass a 'nil' channel here, we could pass a channel that
+	// closes if we wished to cleanup this routine on exit.
+	go kafkaMetrics.PollGoMetricsUntilStop(time.Minute, nil)
+	registrar.Initialize(consenters)
+	return registrar
+}
+
+
+func initializeServerConfig(conf *localconfig.TopLevel, metricsProvider metrics.Provider) comm.ServerConfig {
+	// secure server config
+	secureOpts := comm.SecureOptions{
+		UseTLS:            conf.General.TLS.Enabled,
+		RequireClientCert: conf.General.TLS.ClientAuthRequired,
+		TimeShift:         conf.General.TLS.TLSHandshakeTimeShift,
+	}
+	// check to see if TLS is enabled
+	if secureOpts.UseTLS {
+		msg := "TLS"
+		// load crypto material from files
+		serverCertificate, err := ioutil.ReadFile(conf.General.TLS.Certificate)
+		if err != nil {
+			logger.Fatalf("Failed to load server Certificate file '%s' (%s)",
+				conf.General.TLS.Certificate, err)
+		}
+		serverKey, err := ioutil.ReadFile(conf.General.TLS.PrivateKey)
+		if err != nil {
+			logger.Fatalf("Failed to load PrivateKey file '%s' (%s)",
+				conf.General.TLS.PrivateKey, err)
+		}
+		var serverRootCAs, clientRootCAs [][]byte
+		for _, serverRoot := range conf.General.TLS.RootCAs {
+			root, err := ioutil.ReadFile(serverRoot)
+			if err != nil {
+				logger.Fatalf("Failed to load ServerRootCAs file '%s' (%s)",
+					err, serverRoot)
+			}
+			serverRootCAs = append(serverRootCAs, root)
+		}
+		if secureOpts.RequireClientCert {
+			for _, clientRoot := range conf.General.TLS.ClientRootCAs {
+				root, err := ioutil.ReadFile(clientRoot)
+				if err != nil {
+					logger.Fatalf("Failed to load ClientRootCAs file '%s' (%s)",
+						err, clientRoot)
+				}
+				clientRootCAs = append(clientRootCAs, root)
+			}
+			msg = "mutual TLS"
+		}
+		secureOpts.Key = serverKey
+		secureOpts.Certificate = serverCertificate
+		secureOpts.ServerRootCAs = serverRootCAs
+		secureOpts.ClientRootCAs = clientRootCAs
+		logger.Infof("Starting orderer with %s enabled", msg)
+	}
+	kaOpts := comm.DefaultKeepaliveOptions
+	// keepalive settings
+	// ServerMinInterval must be greater than 0
+	if conf.General.Keepalive.ServerMinInterval > time.Duration(0) {
+		kaOpts.ServerMinInterval = conf.General.Keepalive.ServerMinInterval
+	}
+	kaOpts.ServerInterval = conf.General.Keepalive.ServerInterval
+	kaOpts.ServerTimeout = conf.General.Keepalive.ServerTimeout
+
+	commLogger := flogging.MustGetLogger("core.comm").With("server", "Orderer")
+
+	if metricsProvider == nil {
+		metricsProvider = &disabled.Provider{}
+	}
+
+	return comm.ServerConfig{
+		SecOpts:            secureOpts,
+		KaOpts:             kaOpts,
+		Logger:             commLogger,
+		ServerStatsHandler: comm.NewServerStatsHandler(metricsProvider),
+		ConnectionTimeout:  conf.General.ConnectionTimeout,
+		StreamInterceptors: []grpc.StreamServerInterceptor{
+			grpcmetrics.StreamServerInterceptor(grpcmetrics.NewStreamMetrics(metricsProvider)),
+			grpclogging.StreamServerInterceptor(flogging.MustGetLogger("comm.grpc.server").Zap()),
+		},
+		UnaryInterceptors: []grpc.UnaryServerInterceptor{
+			grpcmetrics.UnaryServerInterceptor(grpcmetrics.NewUnaryMetrics(metricsProvider)),
+			grpclogging.UnaryServerInterceptor(
+				flogging.MustGetLogger("comm.grpc.server").Zap(),
+				grpclogging.WithLeveler(grpclogging.LevelerFunc(grpcLeveler)),
+			),
+		},
+	}
+}
+
+func grpcLeveler(ctx context.Context, fullMethod string) zapcore.Level {
+	switch fullMethod {
+	case "/orderer.Cluster/Step":
+		return flogging.DisabledLevel
+	default:
+		return zapcore.InfoLevel
+	}
+}
+
+
+
+
+
+
+
